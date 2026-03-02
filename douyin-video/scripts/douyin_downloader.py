@@ -70,6 +70,27 @@ DEFAULT_MODEL = "FunAudioLLM/SenseVoiceSmall"
 class DouyinProcessor:
     """抖音视频处理器"""
 
+    @staticmethod
+    def _extract_media_urls(data: dict) -> tuple[Optional[str], list[str], str]:
+        """从作品数据中提取媒体链接，兼容视频与图文。"""
+        video_data = data.get("video") or {}
+        play_addr = video_data.get("play_addr") or {}
+        video_urls = play_addr.get("url_list") or []
+        if video_urls:
+            return video_urls[0].replace("playwm", "play"), [], "video"
+
+        images = data.get("images") or []
+        image_urls = []
+        for image in images:
+            image_url_list = image.get("url_list") or []
+            if image_url_list:
+                image_urls.append(image_url_list[0])
+
+        if image_urls:
+            return None, image_urls, "image_post"
+
+        return None, [], "unknown"
+
     def __init__(self, api_key: str = "", api_base_url: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key
         self.api_base_url = api_base_url or DEFAULT_API_BASE_URL
@@ -90,8 +111,11 @@ class DouyinProcessor:
 
         share_url = urls[0]
         share_response = requests.get(share_url, headers=HEADERS)
-        video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
-        share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
+        resolved_url = share_response.url.split("?")[0].strip("/")
+        url_parts = resolved_url.split("/")
+        content_id = url_parts[-1]
+        content_type = "note" if "/note/" in resolved_url else "video"
+        share_url = f'https://www.iesdouyin.com/share/{content_type}/{content_id}'
 
         # 获取视频页面内容
         response = requests.get(share_url, headers=HEADERS)
@@ -120,17 +144,19 @@ class DouyinProcessor:
 
         data = original_video_info["item_list"][0]
 
-        # 获取视频信息
-        video_url = data["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
-        desc = data.get("desc", "").strip() or f"douyin_{video_id}"
+        # 获取媒体信息（视频或图文）
+        video_url, image_urls, media_type = self._extract_media_urls(data)
+        desc = data.get("desc", "").strip() or f"douyin_{content_id}"
 
         # 替换文件名中的非法字符
         desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
 
         return {
             "url": video_url,
+            "image_urls": image_urls,
+            "media_type": media_type,
             "title": desc,
-            "video_id": video_id
+            "video_id": content_id
         }
 
     def download_video(self, video_info: dict, output_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
@@ -146,6 +172,9 @@ class DouyinProcessor:
 
         if show_progress:
             print(f"正在下载视频: {video_info['title']}")
+
+        if not video_info.get("url"):
+            raise ValueError("当前作品是图文内容，无法下载 mp4 视频")
 
         response = requests.get(video_info['url'], headers=HEADERS, stream=True)
         response.raise_for_status()

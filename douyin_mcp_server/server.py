@@ -42,6 +42,27 @@ DEFAULT_MODEL = "paraformer-v2"
 
 class DouyinProcessor:
     """抖音视频处理器"""
+
+    @staticmethod
+    def _extract_media_urls(data: dict) -> tuple[Optional[str], list[str], str]:
+        """从作品数据中提取媒体链接，兼容视频与图文。"""
+        video_data = data.get("video") or {}
+        play_addr = video_data.get("play_addr") or {}
+        video_urls = play_addr.get("url_list") or []
+        if video_urls:
+            return video_urls[0].replace("playwm", "play"), [], "video"
+
+        images = data.get("images") or []
+        image_urls = []
+        for image in images:
+            image_url_list = image.get("url_list") or []
+            if image_url_list:
+                image_urls.append(image_url_list[0])
+
+        if image_urls:
+            return None, image_urls, "image_post"
+
+        return None, [], "unknown"
     
     def __init__(self, api_key: str, model: Optional[str] = None):
         self.api_key = api_key
@@ -65,8 +86,11 @@ class DouyinProcessor:
         
         share_url = urls[0]
         share_response = requests.get(share_url, headers=HEADERS)
-        video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
-        share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
+        resolved_url = share_response.url.split("?")[0].strip("/")
+        url_parts = resolved_url.split("/")
+        content_id = url_parts[-1]
+        content_type = "note" if "/note/" in resolved_url else "video"
+        share_url = f'https://www.iesdouyin.com/share/{content_type}/{content_id}'
         
         # 获取视频页面内容
         response = requests.get(share_url, headers=HEADERS)
@@ -95,21 +119,26 @@ class DouyinProcessor:
 
         data = original_video_info["item_list"][0]
 
-        # 获取视频信息
-        video_url = data["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
-        desc = data.get("desc", "").strip() or f"douyin_{video_id}"
+        # 获取媒体信息（视频或图文）
+        video_url, image_urls, media_type = self._extract_media_urls(data)
+        desc = data.get("desc", "").strip() or f"douyin_{content_id}"
         
         # 替换文件名中的非法字符
         desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
         
         return {
             "url": video_url,
+            "image_urls": image_urls,
+            "media_type": media_type,
             "title": desc,
-            "video_id": video_id
+            "video_id": content_id
         }
     
     async def download_video(self, video_info: dict, ctx: Context) -> Path:
         """异步下载视频到临时目录"""
+        if not video_info.get("url"):
+            raise ValueError("当前作品是图文内容，无法下载 mp4 视频")
+
         filename = f"{video_info['video_id']}.mp4"
         filepath = self.temp_dir / filename
         
@@ -215,8 +244,10 @@ def get_douyin_download_link(share_link: str) -> str:
             "video_id": video_info["video_id"],
             "title": video_info["title"],
             "download_url": video_info["url"],
+            "media_type": video_info.get("media_type", "video"),
+            "image_urls": video_info.get("image_urls", []),
             "description": f"视频标题: {video_info['title']}",
-            "usage_tip": "可以直接使用此链接下载无水印视频"
+            "usage_tip": "video 类型可直接下载 mp4；image_post 类型请使用 image_urls 下载图片"
         }, ensure_ascii=False, indent=2)
         
     except Exception as e:
@@ -256,6 +287,14 @@ async def extract_douyin_text(
         ctx.info("正在解析抖音分享链接...")
         video_info = processor.parse_share_url(share_link)
         
+        if not video_info.get("url"):
+            return json.dumps({
+                "status": "error",
+                "error": "该作品是图文内容（无可用音轨），暂不支持语音文案提取",
+                "media_type": video_info.get("media_type", "unknown"),
+                "image_urls": video_info.get("image_urls", [])
+            }, ensure_ascii=False, indent=2)
+
         # 直接使用视频URL进行文本提取
         ctx.info("正在从视频中提取文本...")
         text_content = processor.extract_text_from_video_url(video_info['url'])
@@ -287,6 +326,8 @@ def parse_douyin_video_info(share_link: str) -> str:
             "video_id": video_info["video_id"],
             "title": video_info["title"],
             "download_url": video_info["url"],
+            "media_type": video_info.get("media_type", "video"),
+            "image_urls": video_info.get("image_urls", []),
             "status": "success"
         }, ensure_ascii=False, indent=2)
         
